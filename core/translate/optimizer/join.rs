@@ -783,7 +783,7 @@ fn join_lhs_and_rhs<'a>(
                 build_access_method.map(|method| &method.params),
                 Some(AccessMethodParams::InSeek { .. })
             );
-            let build_read_is_unique_point_lookup = build_access_method.is_some_and(|method| {
+            let build_read_is_unique_seek = build_access_method.is_some_and(|method| {
                 matches!(
                     &method.params,
                     AccessMethodParams::BTreeTable {
@@ -796,16 +796,38 @@ fn join_lhs_and_rhs<'a>(
             });
             // A joined prefix can reach the same unique row more than once.
             // Do not assume that it has more distinct keys than prefix rows.
-            let max_distinct_build_keys = if lhs.data.len() > 1 && build_read_is_unique_point_lookup
-            {
+            let max_distinct_build_keys = if lhs.data.len() > 1 && build_read_is_unique_seek {
                 input_cardinality.min(*build_base_rows)
             } else {
                 *build_base_rows
             };
+            let hash_inputs_have_row_count_stats = matches!(
+                (build_base_rows, rhs_base_rows),
+                (
+                    RowCountEstimate::AnalyzeStats(_),
+                    RowCountEstimate::AnalyzeStats(_)
+                )
+            ) && prior_mask.iter().all(|table_idx| {
+                matches!(
+                    base_table_rows.get(table_idx),
+                    Some(RowCountEstimate::AnalyzeStats(_))
+                )
+            });
+            let hash_is_final_join = join_order.len() == joined_tables.len();
+            // Without row counts, the model cannot price rows from repeated prefix keys.
+            // Keep the unique lookup when a later join can prevent this intermediate result.
+            let hash_can_create_unpriced_intermediate_rows = build_read_is_unique_seek
+                && !hash_inputs_have_row_count_stats
+                && !prior_mask.is_empty()
+                && !hash_is_final_join;
             let hash_can_replace_build_index =
                 can_replace_build_index_with_hash(rhs_constraints, build_read_is_in_seek);
 
             let build_table_is_last = build_table_idx == last_lhs_table_idx;
+            let hash_is_full_outer = rhs_table_reference
+                .join_info
+                .as_ref()
+                .is_some_and(|join| join.is_full_outer());
 
             // Eligibility gate: prefer nested-loop when uses a selective probe seek.
             // Probe->build chaining is only allowed when the
@@ -813,7 +835,8 @@ fn join_lhs_and_rhs<'a>(
             let allow_hash_join = !rhs_has_selective_seek
                 && !probe_table_is_prior_build
                 && (!build_has_prior_constraints || build_has_rowid)
-                && !chaining_across_outer;
+                && !chaining_across_outer
+                && (hash_is_full_outer || !hash_can_create_unpriced_intermediate_rows);
 
             tracing::debug!(
                 lhs_table = build_table.table.get_name(),
@@ -822,6 +845,10 @@ fn join_lhs_and_rhs<'a>(
                 rhs_has_selective_seek,
                 rhs_builds_index,
                 hash_can_replace_build_index,
+                hash_inputs_have_row_count_stats,
+                build_read_is_unique_seek,
+                hash_is_final_join,
+                hash_can_create_unpriced_intermediate_rows,
                 probe_table_is_prior_build,
                 build_table_is_prior_probe,
                 chaining_across_outer,
